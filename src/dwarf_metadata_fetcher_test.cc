@@ -84,6 +84,26 @@ TEST(DwarfMetadataFetcherTest, FetchAndProcessDebuggingInfo) {
   }
 }
 
+TEST(DwarfMetadataFetcherTest, FetchAndProcessDebuggingInfoParallel) {
+  const std::string dwarf_path = blaze_util::JoinPath(
+      kDwarfMetadataFetchTestPath, "dwarfmetadata_testdata.dwarf");
+
+  const std::string linker_build_id = "1001";
+
+  std::unique_ptr<BinaryFileRetriever> retriever =
+      BinaryFileRetriever::CreateMockRetriever({{linker_build_id, dwarf_path}});
+
+  DwarfMetadataFetcher test_target(std::move(retriever), ::testing::TempDir(),
+                                   /*read_subprograms=*/false,
+                                   /*write_to_cache=*/true,
+                                   /*parse_thread_count=*/8);
+
+  ASSERT_OK(test_target.FetchWithPath({{linker_build_id, dwarf_path}},
+                                      /*force_update_cache=*/true));
+
+  TestFunctionality(test_target);
+}
+
 TEST(DwarfMetadataFetcherTest, BasicTest) {
   const std::string raw_dwarf_dir = kDwarfMetadataFetchTestPath;
   ;

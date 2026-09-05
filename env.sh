@@ -22,7 +22,7 @@ export LLVM_BIN_DIR="${TOP_DIR}/third_party/llvm-project/install/bin"
 export TESTSUITE_DIR="${TOP_DIR}/testsuite/"
 
 #Change open file limit for DCPerf.
-ulimit -n 65535
+# ulimit -n 65535
 
 export PATH="${LLVM_BIN_DIR}:$PATH"
 export CC="${LLVM_BIN_DIR}/clang"

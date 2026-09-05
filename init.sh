@@ -72,6 +72,8 @@ sudo apt update
 
 log "Installing system dependencies..."
 sudo apt-get install -y \
+gcc-12 \
+g++-12 \
 clang \
 lld \
 lldb \
@@ -95,6 +97,13 @@ libtinfo-dev \
 pkg-config \
 selinux-utils \
 unzip \
+libevent-dev \
+pkg-config \
+dwarves \
+libpcre3-dev \
+libevent-dev \
+libboost-dev \
+libfmt-dev \
 numactl # For Spec
 
 # Install 6.4.0 bazel for field access tool.
@@ -142,7 +151,7 @@ elif [ "$skip_llvm" = false ]; then
 log "Building local LLVM/Clang toolchain..."
 pushd "${TOP_DIR}/third_party/llvm-project/" >/dev/null
 cmake -S llvm -B build -G Ninja \
--DLLVM_ENABLE_PROJECTS="clang;compiler-rt;lld" \
+-DLLVM_ENABLE_PROJECTS="clang;compiler-rt;lld;openmp" \
 -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind" \
 -DCMAKE_LINKER="lld" \
 -DCMAKE_INSTALL_PREFIX="$(pwd)/install" \
@@ -152,7 +161,7 @@ cmake -S llvm -B build -G Ninja \
 -DCMAKE_C_FLAGS="-O2" \
 -DCMAKE_CXX_FLAGS="-O2" \
 -DLLVM_ENABLE_LLD=On \
--DLLVM_TARGETS_TO_BUILD=host \
+-DLLVM_TARGETS_TO_BUILD=host
 
 log "Starting LLVM build (make take a while)..."
 

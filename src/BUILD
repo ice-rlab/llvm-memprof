@@ -136,6 +136,7 @@ cc_library(
     srcs = ["histogram_builder.cc"],
     hdrs = ["histogram_builder.h"],
     deps = [
+        # ":allocation_data",
         ":dwarf_metadata_fetcher",
         ":type_resolver",
         ":type_tree",
@@ -157,6 +158,15 @@ cc_library(
         "@status_macros//:status_macros",
     ],
 )
+
+# cc_library(
+#     name = "allocation_data",
+#     srcs = ["allocation_data.cc"],
+#     hdrs = ["allocation_data.h"],
+#     deps = [
+#         ":status_macros",
+#     ]
+# )
 
 cc_test(
     name = "dwarf_metadata_fetcher_test",

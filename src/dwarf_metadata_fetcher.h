@@ -238,6 +238,8 @@ class DwarfMetadataFetcher {
       types[type_name] = std::move(type);
     }
 
+    void MergeFrom(TypeData &other);
+
     // Visit child die, recursive parse if needed.
     void VisitChildDIE(const llvm::DWARFDie &child_die,
                        bool should_read_subprogram,

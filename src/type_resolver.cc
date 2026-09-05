@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -20,12 +20,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
@@ -47,6 +50,20 @@ namespace devtools_crosstool_fdo_field_access {
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
 
+absl::string_view AllocationCategoryToString(
+    AllocationCategory allocation_category) {
+  switch (allocation_category) {
+    case AllocationCategory::kSimple:
+      return "simple";
+    case AllocationCategory::kAllocationAware:
+      return "allocation-aware";
+    case AllocationCategory::kComplex:
+      return "complex";
+  }
+
+  return "unknown";
+}
+
 constexpr absl::string_view kSTLContainerTypes[] = {
     "std::_Vector_base",
     "std::_Vector_base",
@@ -62,9 +79,7 @@ constexpr absl::string_view kSTLContainerTypes[] = {
     "std::_Fwd_list_base",
     "std::_List_base",
     "std::list",
-    "absl::FixedArray",
-    "xalanc_1_10::XalanVector",
-};
+    "absl::FixedArray"};
 
 constexpr absl::string_view kSTLContainerLeafCheckTypes[] = {
     "std::vector",
@@ -92,25 +107,41 @@ constexpr absl::string_view kSmartPointersTypes[] = {
     "_ZNS11make_unique"};
 
 constexpr absl::string_view kADTContainerTypes[] = {
-    "llvm::SmallVectorTemplateBase<", "llvm::PagedVector<",
-    "llvm::SmallPtrSetImpl<", "llvm::StringMap<",
-    "llvm::ImutAVLFactory<, absl::inlined_vector_internal:"};
+    "llvm::SmallVectorTemplateBase<",
+    "llvm::PagedVector<",
+    "llvm::SmallPtrSetImpl<",
+    "llvm::StringMap<",
+    "llvm::ImutAVLFactory<",
+    "absl::inlined_vector_internal::Storage<",
+    // GCC's hand-rolled growable array (vec.h). va_heap::reserve<T> and
+    // va_gc::reserve<T, A> take the vec<T, ...> as an explicit formal
+    // parameter (a reference to a pointer, since realloc may move the
+    // buffer), which is exactly the shape this strategy already handles
+    // for llvm::SmallVectorTemplateBase<T>.
+    "vec<"};
 
 constexpr absl::string_view kADTDenseContainerTypes[] = {"llvm::DenseMapBase"};
 
 constexpr absl::string_view kCharContainerTypesLeafFrame[] = {
-    "std::basic_string", "std::basic_string",
-    "absl::cord_internal::", "std::basic_string", "absl::Cord::"};
+    "std::basic_string", "std::basic_string", "absl::cord_internal::",
+    "std::basic_string", "absl::Cord::",      "std::basic_istream<",
+    "operator>>",
+    // GCC's GC allocator for memory that contains no GC-managed pointers
+    // (so the collector never needs to scan/mark it) -- effectively an
+    // untyped byte blob, same as the other entries in this list.
+    "ggc_alloc_atomic"};
 
 constexpr absl::string_view kABSLContainerSwissMapTypes[] = {
     "absl::container_internal::raw_hash_map<",
     "absl::container_internal::raw_hash_set<",
 };
 
-// constexpr absl::string_view kABSLContainerNodeHashTypes[] = {
-//     "absl::container_internal::NodeHashMapPolicy",
-//     "absl::container_internal::NodeHashSetPolicy",
-// };
+constexpr absl::string_view kContiguousTemplateContainerTypes[] = {
+    "xalanc_1_10::XalanVector<",
+    "xercesc::ValueVectorOf<",
+    "xercesc_3_1::ValueVectorOf<",
+    "xercesc_3_2::ValueVectorOf<",
+};
 
 constexpr absl::string_view kABSLContainerFlatHashTypes[] = {
     "absl::container_internal::FlatHashMapPolicy",
@@ -128,12 +159,65 @@ constexpr absl::string_view kSpecialAllocatingFunctions[] = {
 };
 
 constexpr absl::string_view kAllocatorWrappers[] = {
-    "std::allocator", "std::__new_allocator", "__gnu_cxx::new_allocator",
+    "std::allocator",
+    "std::__new_allocator",
+    "__gnu_cxx::new_allocator",
     "muppet::instant::PolymorphicAllocator",
-    "xalanc_1_10::MemoryManagedConstructionTraits"};
+    "xalanc_1_10::MemoryManagedConstructionTraits",
+    "llama::bloballoc::AlignedAllocator"};
 
-// Keywords for functions specially inserted by memprof. Used to distinguish
-// user types allocated by the container vs the metadata.
+constexpr absl::string_view kProtobufArenaConstructingFunctions[] = {
+    "google::protobuf::Arena::DefaultConstruct<",
+    "google::protobuf::Arena::Create<",
+    // Copy-constructs T on the arena (protobuf message copy, e.g. via
+    // Message::New(Arena*) + CopyFrom, or RepeatedPtrField element copies).
+    "google::protobuf::Arena::CopyConstruct<",
+    // Allocates an array of T on the arena (e.g. RepeatedField<T> growth
+    // backed by arena storage).
+    "google::protobuf::Arena::CreateArray<",
+};
+
+// grpc_core::Arena::Alloc/AllocZone are untyped size_t-only bump allocators,
+// so the type can only be recovered from the templated factory that calls
+// them. grpc_core::Arena::New<T>(...) is that factory; its mangled name
+// carries T even though the frames below it (Alloc/AllocZone/
+// gpr_malloc_aligned) do not. ManagedNew<T> and MakeRefCounted<T> both
+// forward into New<...> (e.g. as New<ManagedNewImpl<T>>), so matching New<
+// alone covers them too.
+constexpr absl::string_view kGrpcArenaConstructingFunctions[] = {
+    "grpc_core::Arena::New<",
+};
+
+// xcallocator<Type>::data_alloc(size_t) (gcc/hash-table.h) is a static
+// member function template that does
+// `return static_cast<Type*>(xcalloc(count, sizeof(Type)))`. Type appears
+// only in the class template argument (there is no allocator instance and
+// no formal parameter carrying it, since data_alloc is static), so it has
+// to be pulled from the function's own demangled name, same as the arena
+// factories above.
+constexpr absl::string_view kXcallocatorConstructingFunctions[] = {
+    "xcallocator<",
+};
+
+// GCC's garbage collector allocation entry point, `template<typename T> T*
+// ggc_alloc()` (ggc.h). Behaves exactly like grpc_core::Arena::New<T> and
+// google::protobuf::Arena::Create<T>: T only shows up in the function's own
+// template argument.
+constexpr absl::string_view kGgcAllocConstructingFunctions[] = {
+    "ggc_alloc<",
+};
+
+// GCC's gengtype code generator also emits one non-template allocation
+// function per GC-managed type, named `ggc_alloc_<Type>_stat` (or
+// `ggc_alloc_cleared_<Type>_stat` for the zero-initializing variant), e.g.
+// `ggc_alloc_cleared_tree_node_stat` allocates a `tree_node`. Unlike the
+// template factories above, Type has to be recovered from the function
+// name's own prefix/suffix rather than a template argument -- see
+// ExtractGgcAllocStatType.
+constexpr absl::string_view kGgcAllocStatPrefix = "ggc_alloc_";
+constexpr absl::string_view kGgcAllocStatClearedInfix = "cleared_";
+constexpr absl::string_view kGgcAllocStatSuffix = "_stat";
+
 constexpr absl::string_view kMemprofInsertedFunctions[] = {
     "__memprof_ctrl_alloc",
 };
@@ -142,15 +226,205 @@ static std::string stripTrailingColons(const std::string& str) {
   size_t last_non_colon = str.find_last_not_of(':');
   if (last_non_colon == std::string::npos) {
     return "";
-  } else {
-    return str.substr(0, last_non_colon + 1);
   }
+  return str.substr(0, last_non_colon + 1);
+}
+
+static std::optional<std::string> ExtractFirstTemplateArgument(
+    absl::string_view demangled_name, absl::string_view function_prefix) {
+  const size_t prefix_pos = demangled_name.find(function_prefix);
+  if (prefix_pos == absl::string_view::npos) {
+    return std::nullopt;
+  }
+
+  const size_t argument_begin = prefix_pos + function_prefix.size();
+  int angle_depth = 0;
+  int paren_depth = 0;
+  int bracket_depth = 0;
+  int brace_depth = 0;
+
+  for (size_t i = argument_begin; i < demangled_name.size(); ++i) {
+    const char c = demangled_name[i];
+
+    switch (c) {
+      case '<':
+        ++angle_depth;
+        break;
+      case '>':
+        if (angle_depth == 0) {
+          absl::string_view argument =
+              demangled_name.substr(argument_begin, i - argument_begin);
+          argument = absl::StripAsciiWhitespace(argument);
+          if (argument.empty()) {
+            return std::nullopt;
+          }
+          return std::string(argument);
+        }
+        --angle_depth;
+        break;
+      case '(':
+        ++paren_depth;
+        break;
+      case ')':
+        if (paren_depth > 0) {
+          --paren_depth;
+        }
+        break;
+      case '[':
+        ++bracket_depth;
+        break;
+      case ']':
+        if (bracket_depth > 0) {
+          --bracket_depth;
+        }
+        break;
+      case '{':
+        ++brace_depth;
+        break;
+      case '}':
+        if (brace_depth > 0) {
+          --brace_depth;
+        }
+        break;
+      case ',':
+        if (angle_depth == 0 && paren_depth == 0 && bracket_depth == 0 &&
+            brace_depth == 0) {
+          absl::string_view argument =
+              demangled_name.substr(argument_begin, i - argument_begin);
+          argument = absl::StripAsciiWhitespace(argument);
+          if (argument.empty()) {
+            return std::nullopt;
+          }
+          return std::string(argument);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  return std::nullopt;
+}
+
+// Given the content already inside a template's angle brackets (e.g.
+// "float, 64" from AlignedAllocator<float, 64>), returns just the first
+// top-level, comma-separated argument ("float"). Returns the whole input
+// unchanged if it contains no top-level comma.
+static std::string TakeFirstTopLevelTemplateArgument(absl::string_view s) {
+  int angle_depth = 0;
+  int paren_depth = 0;
+  int bracket_depth = 0;
+  int brace_depth = 0;
+
+  for (size_t i = 0; i < s.size(); ++i) {
+    switch (s[i]) {
+      case '<':
+        ++angle_depth;
+        break;
+      case '>':
+        if (angle_depth > 0) --angle_depth;
+        break;
+      case '(':
+        ++paren_depth;
+        break;
+      case ')':
+        if (paren_depth > 0) --paren_depth;
+        break;
+      case '[':
+        ++bracket_depth;
+        break;
+      case ']':
+        if (bracket_depth > 0) --bracket_depth;
+        break;
+      case '{':
+        ++brace_depth;
+        break;
+      case '}':
+        if (brace_depth > 0) --brace_depth;
+        break;
+      case ',':
+        if (angle_depth == 0 && paren_depth == 0 && bracket_depth == 0 &&
+            brace_depth == 0) {
+          return std::string(absl::StripAsciiWhitespace(s.substr(0, i)));
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  return std::string(s);
+}
+
+static std::optional<std::string> ExtractProtobufArenaType(
+    absl::string_view demangled_name) {
+  for (absl::string_view function_prefix :
+       kProtobufArenaConstructingFunctions) {
+    if (auto type_name =
+            ExtractFirstTemplateArgument(demangled_name, function_prefix)) {
+      return type_name;
+    }
+  }
+  return std::nullopt;
+}
+
+static std::optional<std::string> ExtractGrpcArenaType(
+    absl::string_view demangled_name) {
+  for (absl::string_view function_prefix : kGrpcArenaConstructingFunctions) {
+    if (auto type_name =
+            ExtractFirstTemplateArgument(demangled_name, function_prefix)) {
+      return type_name;
+    }
+  }
+  return std::nullopt;
+}
+
+static std::optional<std::string> ExtractXcallocatorType(
+    absl::string_view demangled_name) {
+  for (absl::string_view function_prefix : kXcallocatorConstructingFunctions) {
+    if (auto type_name =
+            ExtractFirstTemplateArgument(demangled_name, function_prefix)) {
+      return type_name;
+    }
+  }
+  return std::nullopt;
+}
+
+static std::optional<std::string> ExtractGgcAllocType(
+    absl::string_view demangled_name) {
+  for (absl::string_view function_prefix : kGgcAllocConstructingFunctions) {
+    if (auto type_name =
+            ExtractFirstTemplateArgument(demangled_name, function_prefix)) {
+      return type_name;
+    }
+  }
+  return std::nullopt;
+}
+
+// Matches gengtype-generated allocators named `ggc_alloc_<Type>_stat` or
+// `ggc_alloc_cleared_<Type>_stat` and returns <Type>, e.g.
+// "ggc_alloc_cleared_tree_node_stat" -> "tree_node".
+static std::optional<std::string> ExtractGgcAllocStatType(
+    absl::string_view demangled_name) {
+  if (!absl::StartsWith(demangled_name, kGgcAllocStatPrefix) ||
+      !absl::EndsWith(demangled_name, kGgcAllocStatSuffix)) {
+    return std::nullopt;
+  }
+  absl::string_view middle = demangled_name.substr(
+      kGgcAllocStatPrefix.size(),
+      demangled_name.size() - kGgcAllocStatPrefix.size() -
+          kGgcAllocStatSuffix.size());
+  absl::ConsumePrefix(&middle, kGgcAllocStatClearedInfix);
+  if (middle.empty()) {
+    return std::nullopt;
+  }
+  return std::string(middle);
 }
 
 std::string DwarfTypeResolver::MakeTypePrefixPattern(
     absl::string_view canonical) {
-  while (!canonical.empty() && canonical.back() == ':')
+  while (!canonical.empty() && canonical.back() == ':') {
     canonical.remove_suffix(1);
+  }
   const size_t lt = canonical.find('<');
   absl::string_view head =
       (lt == absl::string_view::npos) ? canonical : canonical.substr(0, lt);
@@ -171,7 +445,9 @@ std::optional<std::string> DwarfTypeResolver::TypeStartsWith(
   const std::string pat = MakeTypePrefixPattern(canonical);
   re2::RE2 re(pat);
   std::string m;
-  if (re2::RE2::PartialMatch(s, re, &m)) return m;
+  if (re2::RE2::PartialMatch(s, re, &m)) {
+    return m;
+  }
   return std::nullopt;
 }
 
@@ -218,18 +494,11 @@ std::string BuildErrorMessageInResolution(
   return error_message;
 }
 
-// Check if there is a conflict in a field offset. This can happen in
-// some STL cases, such as std::pair or std::vector. CPP uses for template
-// types. Pragmatic heuristic we use: Resolve all types with the same
-// offset, and take the one with the largest size. Often the "hidden" type has
-// a size of 1 byte, even when the "real" field has a larger size.
 absl::StatusOr<std::vector<const DwarfMetadataFetcher::FieldData*>>
 DwarfTypeResolver::ResolveFieldConflicts(
     const DwarfMetadataFetcher::TypeData* type_data) {
   std::vector<const DwarfMetadataFetcher::FieldData*> resolved_fields;
 
-  // If we have a union, we don't need to resolve fields --- We expect
-  // conflicts! We should ONLY have legal conflicts in unions.
   if (type_data->data_type == DwarfMetadataFetcher::DataType::UNION) {
     resolved_fields.reserve(type_data->fields.size());
     for (auto& field : type_data->fields) {
@@ -249,18 +518,14 @@ DwarfTypeResolver::ResolveFieldConflicts(
     const DwarfMetadataFetcher::TypeData* type_data_for_offset = nullptr;
     const DwarfMetadataFetcher::FieldData* field_data_for_offset = nullptr;
 
-    // Get the offset to index map in the typedata. We detect a conflict
-    // using this map.
     auto it = type_data->offset_idx.find(offset);
     if (it == type_data->offset_idx.end()) {
       return absl::InvalidArgumentError(
           absl::StrCat("Dwarf data is invalid, field offset index and "
-                       "field data invalid "
-                       "for type: ",
+                       "field data invalid for type: ",
                        type_data->name));
     }
 
-    // Normal case, there is no conflict.
     if (it->second.size() == 1) {
       resolved_fields.push_back(type_data->fields[*(it->second.begin())].get());
       continue;
@@ -278,65 +543,36 @@ DwarfTypeResolver::ResolveFieldConflicts(
       }
 
       status_or_type_data = metadata_fetcher_->GetType(field_data->type_name);
-
-      // Continue if we can't resolve the type.
       if (!status_or_type_data.ok()) {
         continue;
       }
 
-      // Set initial largest field.
       if (!type_data_for_offset || !field_data_for_offset) {
         type_data_for_offset = status_or_type_data.value();
         field_data_for_offset = field_data;
         continue;
       }
-      // Special case when conflicting fields have same size and same number of
-      // fields
+
       if (type_data_for_offset->size == status_or_type_data.value()->size &&
           type_data_for_offset->fields.size() ==
               status_or_type_data.value()->fields.size()) {
-        // Tiebreaker: When both options are the same size, if the new
-        // type is inherited, and the old type is not, replace the old
-        // type.
         if (!field_data_for_offset->inherited && field_data->inherited) {
           type_data_for_offset = status_or_type_data.value();
           field_data_for_offset = field_data;
         } else if (absl::StartsWith(field_data_for_offset->name, "_") &&
                    !absl::StartsWith(field_data->name, "_")) {
-          // Tiebreaker: When both options are the same size and both have
-          // the same inheritance state, look for "_" prefix.
           type_data_for_offset = status_or_type_data.value();
           field_data_for_offset = field_data;
-        } else if (field_data_for_offset->inherited == field_data->inherited &&
-                   !(absl::StartsWith(field_data_for_offset->name, "_"))) {
-          // If both types have the same size, the same inheritance state,
-          // and both have the same "_" prefix, we have a true conflict.
-          // In this case, for now we do not care which type we choose.
-          LOG(WARNING) << absl::StrCat(
-              "Multiple types with same size, number of fields and tag for "
-              "offset "
-              "confict: ",
-              offset, " for type: ", type_data->name, ". \n",
-              "Conficting types: \n", field_data_for_offset->type_name, "/",
-              type_data_for_offset->size, "/",
-              type_data_for_offset->fields.size(), "/",
-              field_data_for_offset->inherited, "\n == \n",
-              field_data->type_name, "/", status_or_type_data.value()->size,
-              "/", status_or_type_data.value()->fields.size(), "/",
-              field_data->inherited);
         }
         continue;
       }
 
-      // Normal conflict resolution: replace smaller field with larger
-      // field.
       if (type_data_for_offset->size < status_or_type_data.value()->size) {
         type_data_for_offset = status_or_type_data.value();
         field_data_for_offset = field_data;
         continue;
       }
-      // Secondary conflict resolution: field with if the type of the field has
-      // more fields.
+
       if (type_data_for_offset->fields.size() <
           status_or_type_data.value()->fields.size()) {
         type_data_for_offset = status_or_type_data.value();
@@ -348,13 +584,9 @@ DwarfTypeResolver::ResolveFieldConflicts(
       return std::vector<const DwarfMetadataFetcher::FieldData*>();
     }
 
-    // Once we have resolved the type with the largest size, we can
-    // add it to the resolved_fields vector.
     resolved_fields.push_back(field_data_for_offset);
   }
 
-  // Sanity check to make sure the number of resolved fields is the same
-  // as the number of unique offsets. in the original type.
   if (resolved_fields.size() != type_data->offset_idx.size()) {
     return absl::InternalError(absl::StrCat(
         "Panic! Resolve field conflicts was not able to resolve "
@@ -367,17 +599,36 @@ DwarfTypeResolver::ResolveFieldConflicts(
   return resolved_fields;
 }
 
-// If ends with "*" is a pointer, if ends with "&" is a reference, and if ends
-// with "() or )>" is a function. All are indirection types with size
-// `pointer_size`.
 bool DwarfTypeResolver::IsIndirection(absl::string_view type_name) {
   return absl::EndsWith(type_name, "*") || absl::EndsWith(type_name, "&") ||
          absl::EndsWith(type_name, "()") || absl::EndsWith(type_name, ")>");
 }
 
 int64_t DwarfTypeResolver::GetArrayMultiplicity(absl::string_view type_name) {
-  int64_t multiplicity = 1;
-  RE2::PartialMatch(type_name, "\\[(\\d+)\\]$", &multiplicity);
+  if (type_name.size() < 3 || type_name.back() != ']') {
+    return 1;
+  }
+
+  const size_t open_bracket = type_name.rfind('[');
+  if (open_bracket == absl::string_view::npos ||
+      open_bracket + 1 == type_name.size() - 1) {
+    return 1;
+  }
+
+  int64_t multiplicity = 0;
+  for (size_t i = open_bracket + 1; i + 1 < type_name.size(); ++i) {
+    const char c = type_name[i];
+    if (c < '0' || c > '9') {
+      return 1;
+    }
+
+    const int64_t digit = c - '0';
+    if (multiplicity > (std::numeric_limits<int64_t>::max() - digit) / 10) {
+      return 1;
+    }
+    multiplicity = multiplicity * 10 + digit;
+  }
+
   return multiplicity;
 }
 
@@ -387,25 +638,14 @@ std::string DwarfTypeResolver::GetArrayChildTypeName(
   RE2::GlobalReplace(&child_type_name, "\\[(\\d+)\\]$", "");
   return child_type_name;
 }
+
 void DwarfTypeResolver::DereferencePointer(std::string* type_name) {
-  // Remove exactly one space and one "*" character in typename.
   RE2::GlobalReplace(type_name, " \\*$", "");
 }
 
 void DwarfTypeResolver::CleanTypeName(std::string* type_name) {
-  // Remove whitespace from pointer. This is so we have a unified
-  // way of handling pointers here, so "A*" instead of "A *", which can
-  // otherwise cause confusion. Only do this to pointer at end.
   RE2::GlobalReplace(type_name, " \\*$", "*");
-
-  // The keyword const is not in the Dwarf type name, so we need to remove it.
-  // Sometimes, types have DW_tag_const_type, but a lot of times we can not
-  // rely on this type being generated. It is safer to remove const, as it is
-  // not important for type resolution.
   *type_name = absl::StripPrefix(*type_name, "const");
-
-  // Strip any leading whitespace leftover from stripping const or consuming
-  // brackets.
   *type_name = absl::StripLeadingAsciiWhitespace(*type_name);
 }
 
@@ -415,20 +655,18 @@ std::string DwarfTypeResolver::UnwrapAndCleanTypeName(
       type_name.begin(), type_name.end());
   DwarfTypeResolver::CleanTypeName(&alloc_type);
 
-  // Very hacky way of dealing with Polymorphic allocator type.
-  if (alloc_type.ends_with(", false")) {
-    alloc_type = alloc_type.substr(0, alloc_type.size() - 7);
-  } else if (alloc_type.ends_with(", true")) {
-    alloc_type = alloc_type.substr(0, alloc_type.size() - 6);
-  }
+  // Allocator templates may carry trailing non-type template arguments after
+  // the value_type (e.g. CompressedTuple<T, false> or
+  // llama::bloballoc::AlignedAllocator<T, Alignment>). Keep only the first
+  // top-level template argument, which is always the value_type.
+  alloc_type = TakeFirstTopLevelTemplateArgument(alloc_type);
   return alloc_type;
 }
 
 std::string WrapType(absl::string_view outer_type,
                      absl::string_view inner_type) {
-  std::string wrapped_type = absl::StrCat(
-      outer_type, "<", inner_type, inner_type.ends_with(">") ? " >" : ">");
-  return wrapped_type;
+  return absl::StrCat(outer_type, "<", inner_type,
+                      inner_type.ends_with(">") ? " >" : ">");
 }
 
 absl::StatusOr<std::unique_ptr<TypeTree::Node>> DwarfTypeResolver::BuildTree(
@@ -444,12 +682,6 @@ absl::StatusOr<std::unique_ptr<TypeTree::Node>> DwarfTypeResolver::BuildTree(
                    metadata_fetcher_->GetType(type_name));
   std::unique_ptr<TypeTree::Node> root_node =
       TypeTree::Node::CreateRootNode(type_name, type_data);
-
-  // auto type_data_or_err =  metadata_fetcher_->GetType(type_name);
-  // if(!type_data_or_err.ok()){
-  //   return type_data_or_err.status();
-  // }
-  // const DwarfMetadataFetcher::TypeData* type_data = type_data_or_err.value();
 
   ASSIGN_OR_RETURN(
       const std::vector<const DwarfMetadataFetcher::FieldData*> resolved_fields,
@@ -471,32 +703,45 @@ absl::StatusOr<std::unique_ptr<TypeTree::Node>> DwarfTypeResolver::BuildTree(
         << " at offset: " << field_data->offset;
     root_node->AddChildAndInsertPaddingIfNecessary(
         std::move(child_node), root_node.get(), field_index, resolved_fields);
-    field_index++;
+    ++field_index;
   }
   return root_node;
 }
 
 std::unique_ptr<TypeTree::Node> DwarfTypeResolver::BuildTreeRecursive(
     BuilderCtxt ctxt) {
+  constexpr int kMaxTypeTreeRecursionDepth = 256;
+
   QCHECK(ctxt.parent_node != nullptr) << "Parent can't be null.";
 
-  // Indirection case: we create a node manually without getting the base type
-  // of the indirection based on the pointer size.
+  auto create_unresolved_node = [&]() {
+    int64_t inferred_size =
+        ctxt.resolved_fields.empty()
+            ? ctxt.parent_node->GetSizeBits()
+            : ctxt.field_index >= ctxt.resolved_fields.size() - 1
+                  ? ctxt.parent_node->GetSizeBits() -
+                        ctxt.resolved_fields[ctxt.field_index]->offset * 8
+                  : ctxt.resolved_fields[ctxt.field_index + 1]->offset * 8 -
+                        ctxt.resolved_fields[ctxt.field_index]->offset * 8;
+    return TypeTree::Node::CreateUnresolvedTypeNode(
+        ctxt.field_name, ctxt.type_name, ctxt.field_offset, ctxt.multiplicity,
+        inferred_size, ctxt.parent_node);
+  };
+
+  if (ctxt.recursion_depth >= kMaxTypeTreeRecursionDepth) {
+    LOG(WARNING) << "Type-tree recursion depth exceeded while resolving "
+                 << ctxt.type_name;
+    return create_unresolved_node();
+  }
+
   if (IsIndirection(ctxt.type_name)) {
     return TypeTree::Node::CreatePointerNode(
         ctxt.field_name, ctxt.type_name, ctxt.field_offset, ctxt.multiplicity,
         metadata_fetcher_->GetPointerSize() * 8, ctxt.parent_node);
   }
-  int64_t child_multiplicity = GetArrayMultiplicity(ctxt.type_name);
 
-  if (child_multiplicity > 1 /*Array case.*/) {
-    // An array type node is created with the size of the all array elements
-    // summed up. An array node will always have exactly one child, which is
-    // the type of the array elements. The multiplicity of the child is the
-    // number of elements in the array.
-
-    // Create node without size for now, since cannot get the size until
-    // the whole subtree is resolved.
+  const int64_t child_multiplicity = GetArrayMultiplicity(ctxt.type_name);
+  if (child_multiplicity > 1) {
     std::unique_ptr<TypeTree::Node> curr_node =
         TypeTree::Node::CreateArrayTypeNode(
             ctxt.field_name, ctxt.type_name, /*size_bits=*/-1,
@@ -510,35 +755,33 @@ std::unique_ptr<TypeTree::Node> DwarfTypeResolver::BuildTreeRecursive(
         .multiplicity = child_multiplicity,
         .parent_node = curr_node.get(),
         .resolved_fields = {},
+        .active_types = ctxt.active_types,
+        .recursion_depth = ctxt.recursion_depth + 1,
     });
 
-    // Once all the subtree is resolved, we can set the size of the array.
-    // The only scenario in which this breaks, is if we have an are forced to
-    // create an Unresolved node or padding in the subtree, which may rely in
-    // the parent size. This should be extremely rare, if at all possible.
     curr_node->SetSizeBits(subtree->GetSizeBits() * subtree->GetMultiplicity());
     curr_node->AddChildAndInsertPaddingIfNecessary(
         std::move(subtree), curr_node.get(), /*field_index=*/0, {});
     return curr_node;
   }
 
-  // Normal case: we create a node based on the TypeData from the
-  // DwarfMetadataFetcher.
   auto status_or = metadata_fetcher_->GetType(ctxt.type_name);
   if (!status_or.ok()) {
-    int64_t inferred_size =
-        ctxt.resolved_fields.empty() ? ctxt.parent_node->GetSizeBits()
-        : ctxt.field_index >= ctxt.resolved_fields.size() - 1
-            ? ctxt.parent_node->GetSizeBits() -
-                  ctxt.resolved_fields[ctxt.field_index]->offset * 8
-            : ctxt.resolved_fields[ctxt.field_index + 1]->offset * 8 -
-                  ctxt.resolved_fields[ctxt.field_index]->offset * 8;
-    return TypeTree::Node::CreateUnresolvedTypeNode(
-        ctxt.field_name, ctxt.type_name, ctxt.field_offset, ctxt.multiplicity,
-        inferred_size, ctxt.parent_node);
+    return create_unresolved_node();
   }
 
   const DwarfMetadataFetcher::TypeData* type_data = status_or.value();
+  if (!ctxt.active_types.insert(type_data).second) {
+    LOG(WARNING) << "Recursive type expansion detected while resolving "
+                 << ctxt.type_name;
+    return TypeTree::Node::CreateNodeFromTypedata(
+        ctxt.field_name, ctxt.type_name, ctxt.field_offset, ctxt.multiplicity,
+        type_data, ctxt.parent_node);
+  }
+
+  auto remove_active_type = absl::MakeCleanup(
+      [&ctxt, type_data] { ctxt.active_types.erase(type_data); });
+
   std::unique_ptr<TypeTree::Node> curr_node =
       TypeTree::Node::CreateNodeFromTypedata(
           ctxt.field_name, ctxt.type_name, ctxt.field_offset, ctxt.multiplicity,
@@ -546,19 +789,19 @@ std::unique_ptr<TypeTree::Node> DwarfTypeResolver::BuildTreeRecursive(
 
   absl::StatusOr<std::vector<const DwarfMetadataFetcher::FieldData*>>
       resolved_fields_or = ResolveFieldConflicts(type_data);
-  if (!status_or.ok()) {
-    LOG(WARNING) << resolved_fields_or.status() << "\n";
-    return curr_node;
-  }
-  if (resolved_fields_or.value().empty()) {
+  if (!resolved_fields_or.ok()) {
+    LOG(WARNING) << resolved_fields_or.status();
     return curr_node;
   }
 
   const std::vector<const DwarfMetadataFetcher::FieldData*>& resolved_fields =
       resolved_fields_or.value();
+  if (resolved_fields.empty()) {
+    return curr_node;
+  }
 
   uint32_t field_index = 0;
-  for (const auto& field_data : resolved_fields) {
+  for (const auto* field_data : resolved_fields) {
     std::unique_ptr<TypeTree::Node> subtree = BuildTreeRecursive({
         .type_name = field_data->type_name,
         .field_name = field_data->name,
@@ -567,11 +810,14 @@ std::unique_ptr<TypeTree::Node> DwarfTypeResolver::BuildTreeRecursive(
         .multiplicity = 1,
         .parent_node = curr_node.get(),
         .resolved_fields = resolved_fields,
+        .active_types = ctxt.active_types,
+        .recursion_depth = ctxt.recursion_depth + 1,
     });
     curr_node->AddChildAndInsertPaddingIfNecessary(
         std::move(subtree), curr_node.get(), field_index, resolved_fields);
-    field_index++;
+    ++field_index;
   }
+
   return curr_node;
 }
 
@@ -590,9 +836,6 @@ DwarfTypeResolver::ResolveTypeFromTypeName(absl::string_view type_name) {
   return CreateTreeFromDwarf(type_name);
 }
 
-// Abseil metadata is allocated separate from user data when using memprof.
-// This function checks if a callstack contains a memprof inserted function to
-// mark that this allocation is metadata.
 std::optional<std::string> CallStackContainsMemprof(
     const AbstractTypeResolver::CallStack& callstack) {
   for (const auto& frame : callstack) {
@@ -638,19 +881,61 @@ DwarfTypeResolver::GetCallStackContainerResolutionStrategy(
           ContainerResolutionStrategy::kSpecialAllocatingFunction);
     }
 
-    auto status_or_formal_params =
-        metadata_fetcher_->GetFormalParameters(func_name);
-    if (!status_or_formal_params.ok()) {
-      continue;
-    }
-    const std::vector<std::string>& formal_params =
-        status_or_formal_params.value();
-
     char* demangled_name_no_params_char =
-        llvm::itaniumDemangle(func_name, /*ParseParams*/ false);
+        llvm::itaniumDemangle(func_name, /*ParseParams=*/false);
     if (demangled_name_no_params_char != nullptr) {
       std::string demangled_name_no_params(demangled_name_no_params_char);
       free(demangled_name_no_params_char);
+
+      if (auto arena_type =
+              ExtractProtobufArenaType(demangled_name_no_params)) {
+        std::string triggering_type = std::move(*arena_type);
+        CleanTypeName(&triggering_type);
+
+        return ContainerResolutionStrategy(
+            "google::protobuf::Arena", func_name,
+            ContainerResolutionStrategy::kProtobufArena, triggering_type);
+      }
+
+      if (auto grpc_arena_type =
+              ExtractGrpcArenaType(demangled_name_no_params)) {
+        std::string triggering_type = std::move(*grpc_arena_type);
+        CleanTypeName(&triggering_type);
+
+        return ContainerResolutionStrategy(
+            "grpc_core::Arena", func_name,
+            ContainerResolutionStrategy::kGrpcArena, triggering_type);
+      }
+
+      if (auto xcallocator_type =
+              ExtractXcallocatorType(demangled_name_no_params)) {
+        std::string triggering_type = std::move(*xcallocator_type);
+        CleanTypeName(&triggering_type);
+
+        return ContainerResolutionStrategy(
+            "xcallocator", func_name,
+            ContainerResolutionStrategy::kXcallocator, triggering_type);
+      }
+
+      if (auto ggc_alloc_type = ExtractGgcAllocType(demangled_name_no_params)) {
+        std::string triggering_type = std::move(*ggc_alloc_type);
+        CleanTypeName(&triggering_type);
+
+        return ContainerResolutionStrategy(
+            "ggc_alloc", func_name, ContainerResolutionStrategy::kGgcAlloc,
+            triggering_type);
+      }
+
+      if (auto ggc_alloc_stat_type =
+              ExtractGgcAllocStatType(demangled_name_no_params)) {
+        std::string triggering_type = std::move(*ggc_alloc_stat_type);
+        CleanTypeName(&triggering_type);
+
+        return ContainerResolutionStrategy(
+            "ggc_alloc_stat", func_name,
+            ContainerResolutionStrategy::kGgcAllocStat, triggering_type);
+      }
+
       if (auto special_allocating_function = StartsWithAnyOf(
               demangled_name_no_params, kSpecialAllocatingFunctions,
               ARRAY_SIZE(kSpecialAllocatingFunctions))) {
@@ -668,16 +953,20 @@ DwarfTypeResolver::GetCallStackContainerResolutionStrategy(
       }
     }
 
+    auto status_or_formal_params =
+        metadata_fetcher_->GetFormalParameters(func_name);
+    if (!status_or_formal_params.ok()) {
+      continue;
+    }
+    const std::vector<std::string>& formal_params =
+        status_or_formal_params.value();
+
     last_frame_has_allocator_formal_param = false;
-    // Check if the function is in the list of supported containers.
     for (const absl::string_view formal_param_dirty : formal_params) {
-      // Make sure unnecessary qualifiers do not pollute the type name we are
-      // looking for.
       std::string formal_param(formal_param_dirty);
       formal_param = absl::StripPrefix(formal_param, "const");
       formal_param = absl::StripLeadingAsciiWhitespace(formal_param);
 
-      // Cleaned formal parameter prepared for output.
       std::string cleaned_formal_param(formal_param);
       DereferencePointer(&cleaned_formal_param);
       CleanTypeName(&cleaned_formal_param);
@@ -694,8 +983,6 @@ DwarfTypeResolver::GetCallStackContainerResolutionStrategy(
           fallthrough_strategy.func_name = func_name;
           fallthrough_strategy.container_name = "unknown";
           fallthrough_strategy.lookup_type = type_name;
-          // Do not return the fallthrough strategy yet, we may find a more
-          // specific strategy later in the callstack.
         }
       }
 
@@ -725,6 +1012,7 @@ DwarfTypeResolver::GetCallStackContainerResolutionStrategy(
             container_type->substr(0, container_type->length() - 1), func_name,
             ContainerResolutionStrategy::kADTContainer, cleaned_formal_param);
       }
+
       if (const auto container_type =
               StartsWithAnyOf(formal_param, kADTDenseContainerTypes,
                               ARRAY_SIZE(kADTDenseContainerTypes))) {
@@ -735,21 +1023,20 @@ DwarfTypeResolver::GetCallStackContainerResolutionStrategy(
       }
 
       if (const auto container_type =
+              StartsWithAnyOf(formal_param, kContiguousTemplateContainerTypes,
+                              ARRAY_SIZE(kContiguousTemplateContainerTypes))) {
+        return ContainerResolutionStrategy(
+            container_type->substr(0, container_type->length() - 1), func_name,
+            ContainerResolutionStrategy::kADTContainer, cleaned_formal_param);
+      }
+
+      if (const auto container_type =
               StartsWithAnyOf(formal_param, kABSLContainerSwissMapTypes,
                               ARRAY_SIZE(kABSLContainerSwissMapTypes))) {
-        // In some special cases node_hash_set uses normal allocator type. Then
-        // we can just use STL container strategy.
         absl::StatusOr<int64_t> alignment =
             GetAlignmentFromAbslAllocatorCall(callstack.at(0).function_name);
         if (!alignment.ok()) {
           alignment = 64;
-          /* ======== HARCODED ABSL CONTAINER VALUES for now ======== */
-          // return ContainerResolutionStrategy(
-          //     container_type->substr(0, container_type->length() - 1),
-          //     callstack.at(0).function_name,
-          //     ContainerResolutionStrategy::kAbslAllocatorAllocate,
-          //     cleaned_formal_param);
-          /* ======== END HARCODED ABSL CONTAINER VALUES for now ======== */
         }
 
         absl::StatusOr<const DwarfMetadataFetcher::TypeData*>
@@ -778,13 +1065,12 @@ DwarfTypeResolver::GetCallStackContainerResolutionStrategy(
               func_name,
               ContainerResolutionStrategy::kAbseilContainerSwissMapFlatHash,
               cleaned_formal_param);
-        } else {
-          return ContainerResolutionStrategy(
-              container_type->substr(0, container_type->length() - 1),
-              func_name,
-              ContainerResolutionStrategy::kAbseilContainerSwissMapNodeHash,
-              cleaned_formal_param);
         }
+
+        return ContainerResolutionStrategy(
+            container_type->substr(0, container_type->length() - 1), func_name,
+            ContainerResolutionStrategy::kAbseilContainerSwissMapNodeHash,
+            cleaned_formal_param);
       }
 
       if (const auto container_type =
@@ -814,8 +1100,6 @@ DwarfTypeResolver::GetCallStackContainerResolutionStrategy(
         BuildCallstackString(callstack)));
   }
 
-  // In the case were we cannot find a specific hardcoded strategy, we go back
-  // to the default strategy. This assume the leaf function name
   return fallthrough_strategy;
 }
 
@@ -841,7 +1125,7 @@ absl::StatusOr<int64_t> DwarfTypeResolver::GetAlignmentFromAbslAllocatorCall(
   auto alignment_it = allocator_type_data->constant_variables.find("Alignment");
   if (alignment_it == allocator_type_data->constant_variables.end()) {
     return absl::NotFoundError(
-        "No constant variable `Alignment` found in Absl allocator call.");
+        "No constant variable Alignment found in Absl allocator call.");
   }
   return alignment_it->second * 8;
 }
@@ -850,9 +1134,30 @@ absl::StatusOr<std::unique_ptr<TypeTree>>
 DwarfTypeResolver::ResolveTypeFromResolutionStrategy(
     const ContainerResolutionStrategy& resolution_strategy,
     const CallStack& callstack, int64_t request_size) {
+  if (resolution_strategy.container_type ==
+          ContainerResolutionStrategy::kProtobufArena ||
+      resolution_strategy.container_type ==
+          ContainerResolutionStrategy::kGrpcArena ||
+      resolution_strategy.container_type ==
+          ContainerResolutionStrategy::kXcallocator ||
+      resolution_strategy.container_type ==
+          ContainerResolutionStrategy::kGgcAlloc ||
+      resolution_strategy.container_type ==
+          ContainerResolutionStrategy::kGgcAllocStat) {
+    if (resolution_strategy.lookup_type.empty()) {
+      return absl::NotFoundError(
+          "Arena strategy has no triggering template type.");
+    }
+
+    return CreateTreeFromDwarf(resolution_strategy.lookup_type,
+                               /*from_container=*/true,
+                               resolution_strategy.container_name);
+  }
+
   ASSIGN_OR_RETURN(
       std::vector<std::string> formal_params,
       metadata_fetcher_->GetFormalParameters(resolution_strategy.func_name));
+
   switch (resolution_strategy.container_type) {
     case ContainerResolutionStrategy::kDefaultStrategy: {
       return CreateTreeFromDwarf(resolution_strategy.lookup_type,
@@ -866,14 +1171,14 @@ DwarfTypeResolver::ResolveTypeFromResolutionStrategy(
       return CreateTreeFromDwarf(type_name, /*from_container=*/true,
                                  resolution_strategy.container_name);
     }
+
     case ContainerResolutionStrategy::kCharContainer: {
       return CreateTreeFromDwarf("char", /*from_container=*/true,
                                  resolution_strategy.container_name);
     }
+
     case ContainerResolutionStrategy::kAbslAllocatorAllocate:
     case ContainerResolutionStrategy::kAllocatorAllocate: {
-      // Walk the callstack from the bottom and find the lowest allocator
-      // type.
       for (const auto& frame : callstack) {
         ASSIGN_OR_RETURN(formal_params, metadata_fetcher_->GetFormalParameters(
                                             frame.function_name));
@@ -909,6 +1214,7 @@ DwarfTypeResolver::ResolveTypeFromResolutionStrategy(
           formal_params, callstack, resolution_strategy,
           "No formal parameters found for the container class."));
     }
+
     case ContainerResolutionStrategy::kADTContainer: {
       ASSIGN_OR_RETURN(
           const DwarfMetadataFetcher::TypeData* type_data,
@@ -935,27 +1241,14 @@ DwarfTypeResolver::ResolveTypeFromResolutionStrategy(
                                  /*from_container=*/true,
                                  resolution_strategy.container_name);
     }
+
     case ContainerResolutionStrategy::kAbseilContainerSwissMapNodeHash:
     case ContainerResolutionStrategy::kAbseilContainerSwissMapFlatHash: {
-      // The Swissmap type resolution relies on a typetree template to resolve
-      // all the metadata allocated alongside the client type. The full type
-      // resolution entails the following steps:
-      // 1. Get the `Alignment` constant of the type from the allocator call.
-      // 2. Get the `kWidth` constant from the `Group` class.
-      // 3. Get the size of the `size_t` type.
-      // 4. Get the size of a pointer type.
-      // 5. Get the client type and build the type tree.
-      // 6. Build the type tree template for the `BackingArray` struct from all
-      // the evaluated constant, request size, and the client type information.
-      // 7. Merge the client type tree into the template type tree.
-      // ASSIGN_OR_RETURN(int64_t Alignment, GetAlignmentFromAbslAllocatorCall(
-      //                                         callstack.at(0).function_name));
       int64_t Alignment = 8;
 
       const std::string absl_internal = *DwarfTypeResolver::TypeStartsWith(
           resolution_strategy.lookup_type, "absl::container_internal");
 
-      /* ======== HARCODED ABSL CONTAINER VALUES for now ======== */
       absl::StatusOr<const DwarfMetadataFetcher::TypeData*> group_type_data_or =
           metadata_fetcher_->GetType(absl::StrCat(absl_internal, "::Group"));
       if (!group_type_data_or.ok()) {
@@ -977,22 +1270,11 @@ DwarfTypeResolver::ResolveTypeFromResolutionStrategy(
             "No constant variable kWidth found."));
       }
       int64_t kWidth = it->second;
-      /* ======== HARCODED ABSL CONTAINER VALUES for now ======== */
-      // int64_t kWidth = 16;
-      /* ======== HARCODED ABSL CONTAINER VALUES for now ======== */
+
       ASSIGN_OR_RETURN(const DwarfMetadataFetcher::TypeData* size_type_data,
                        metadata_fetcher_->GetType("size_t"));
-      // int64_t size_t_size = 64;
-      //* ======== HARCODED ABSL CONTAINER VALUES for now ======== */
-      // int64_t size_t_size = size_type_data->size * 8;
       int64_t size_t_size = size_type_data->size * 8;
 
-      // For now we assume that hashtablez is not enabled. When an allocation is
-      // chosen for sampling, and the BackingArray has a hashtablez_info_handle,
-      // this can cause the type tree to be incorrect and giving is distorted
-      // field access counts. For now, there is no way to know if hashtablez is
-      // enabled or from Dwarf data. Perhaps we can propose removing this field
-      // from the actual heap allocation again.
       bool hashtablez_info = false;
       int64_t hashtablez_info_handle_size =
           metadata_fetcher_->GetPointerSize() * 8;
@@ -1015,9 +1297,6 @@ DwarfTypeResolver::ResolveTypeFromResolutionStrategy(
                 CreateTreeFromDwarf(type_name, /*from_container=*/true,
                                     resolution_strategy.container_name));
 
-            // Special case for local type resolution. We split the metadata
-            // allocation from the backing array allocation, and we can just
-            // return the type of the internal raw_hash_set.
             if (IsLocalTypeResolver()) {
               return type_tree;
             }
@@ -1043,8 +1322,8 @@ DwarfTypeResolver::ResolveTypeFromResolutionStrategy(
                   formal_params, callstack, resolution_strategy,
                   absl::StrCat(
                       "Raw hash set backing array does not match allocation "
-                      "size: ",
-                      "request_size: ", request_size,
+                      "size: request_size: ",
+                      request_size,
                       " tree size: ", outer_tree->Root()->GetFullSizeBytes())));
             }
             return outer_tree;
@@ -1055,19 +1334,8 @@ DwarfTypeResolver::ResolveTypeFromResolutionStrategy(
           formal_params, callstack, resolution_strategy,
           absl::StrCat("Type name: ", type_data->name)));
     }
+
     case ContainerResolutionStrategy::kAbseilContainerBtree: {
-      // The BtreeNode type resolution relies on a typetree template to
-      // resolve all the metadata allocated alongside the client type. The
-      // full type resolution entails the following steps:
-      // 1. Get the `Alignment` constant of the type from the allocator call.
-      // 2. Get the `kNodeSlots` constant from the `Group` class.
-      // 3. Get the size of the `field_type` type.
-      // 4. Get the size of a pointer type.
-      // 5. Get the client type and build the type tree.
-      // 6. Build the type tree template for the `BackingArray` struct from
-      // all the evaluated constant, request size, and the client type
-      // information.
-      // 7. Merge the client type tree into the template type tree.
       ASSIGN_OR_RETURN(int64_t Alignment, GetAlignmentFromAbslAllocatorCall(
                                               callstack.at(0).function_name));
       ASSIGN_OR_RETURN(
@@ -1124,12 +1392,10 @@ DwarfTypeResolver::ResolveTypeFromResolutionStrategy(
                     CreateTreeFromDwarf(type_name, /*from_container=*/true,
                                         resolution_strategy.container_name));
 
-                // Special case for local type resolution. We split the metadata
-                // allocation from the backing array allocation, and we can just
-                // return the type of the internal raw_hash_set.
                 if (IsLocalTypeResolver()) {
                   return slot_type_tree;
                 }
+
                 ASSIGN_OR_RETURN(
                     ObjectLayout template_object_layout,
                     TypeTreeContainerBlueprints::GetBtreeNodeTypeTemplate(
@@ -1139,7 +1405,6 @@ DwarfTypeResolver::ResolveTypeFromResolutionStrategy(
                         metadata_fetcher_->GetPointerSize() * 8,
                         request_size * 8, generation_enabled));
                 std::unique_ptr<TypeTree> btree_node_type_tree =
-
                     TypeTree::CreateTreeFromObjectLayout(
                         template_object_layout,
                         WrapType(absl::StrCat(wrapper, "::btree_node"),
@@ -1152,9 +1417,9 @@ DwarfTypeResolver::ResolveTypeFromResolutionStrategy(
                   return absl::InternalError(BuildErrorMessageInResolution(
                       formal_params, callstack, resolution_strategy,
                       absl::StrCat(
-                          "Btree node does not match allocation "
-                          "size: ",
-                          "request_size: ", request_size, " tree size: ",
+                          "Btree node does not match allocation size: "
+                          "request_size: ",
+                          request_size, " tree size: ",
                           btree_node_type_tree->Root()->GetFullSizeBytes())));
                 }
                 return btree_node_type_tree;
@@ -1168,11 +1433,10 @@ DwarfTypeResolver::ResolveTypeFromResolutionStrategy(
     }
 
     case ContainerResolutionStrategy::kAbseilContainerInserted: {
-      // This is some metadata for containers that we cannot resolve into
-      // a type. Keep as char.
       return CreateTreeFromDwarf("char", /*from_container=*/true,
                                  resolution_strategy.container_name);
     }
+
     default: {
       return absl::InvalidArgumentError(
           "Unknown container type resolution strategy.");
@@ -1180,53 +1444,111 @@ DwarfTypeResolver::ResolveTypeFromResolutionStrategy(
   }
 }
 
-absl::StatusOr<std::unique_ptr<TypeTree>>
+absl::StatusOr<TypeResolutionResult>
 DwarfTypeResolver::ResolveTypeFromCallstack(const CallStack& callstack,
-                                            int64_t request_size) {
-  if (callstack.empty()) {
-    return absl::InvalidArgumentError("Callstack is empty.");
+                                            int64_t request_size,
+                                            absl::Time deadline) {
+  if (absl::Now() >= deadline) {
+    LOG(WARNING) << "[heapalloc] Resolution timed out before starting";
+    return absl::DeadlineExceededError("Type resolution timed out");
   }
 
-  // First try to resolve the type from the first frame. This works with
-  // non-container heap allocations and requires dwarf extension with
-  // DW_TAG_GOOGLE_heapalloc. See cl/647366639 and go/heapalloc-dwarf.
-  for (const auto& frame : callstack) {
-    absl::StatusOr<std::unique_ptr<TypeTree>> type_tree =
-        ResolveTypeFromFrame(frame);
+  absl::StatusOr<ContainerResolutionStrategy> strategy =
+      GetCallStackContainerResolutionStrategy(callstack);
+
+  absl::Status container_resolution_status = strategy.status();
+
+  if (strategy.ok()) {
+    if (absl::Now() >= deadline) {
+      return absl::DeadlineExceededError("Type resolution timed out");
+    }
+
+    auto type_tree =
+        ResolveTypeFromResolutionStrategy(*strategy, callstack, request_size);
+
     if (type_tree.ok()) {
-      return type_tree;
+      AllocationCategory allocation_category =
+          AllocationCategory::kAllocationAware;
+
+      switch (strategy->container_type) {
+        case ContainerResolutionStrategy::kADTContainer:
+        case ContainerResolutionStrategy::kADTDenseContainer:
+        case ContainerResolutionStrategy::kProtobufArena:
+        case ContainerResolutionStrategy::kGrpcArena:
+        case ContainerResolutionStrategy::kXcallocator:
+        case ContainerResolutionStrategy::kGgcAlloc:
+        case ContainerResolutionStrategy::kGgcAllocStat:
+        case ContainerResolutionStrategy::kAbslAllocatorAllocate:
+        case ContainerResolutionStrategy::kAbseilContainerSwissMapNodeHash:
+        case ContainerResolutionStrategy::kAbseilContainerSwissMapFlatHash:
+        case ContainerResolutionStrategy::kAbseilContainerBtree:
+        case ContainerResolutionStrategy::kAbseilContainerInserted:
+          allocation_category = AllocationCategory::kComplex;
+          break;
+        default:
+          break;
+      }
+
+      TypeResolutionResult resolution_result;
+      resolution_result.type_tree = std::move(type_tree.value());
+      resolution_result.allocation_category = allocation_category;
+      resolution_result.resolution_strategy =
+          ContainerResolutionStrategy::TypeToString(strategy->container_type);
+      return resolution_result;
+    }
+
+    container_resolution_status = type_tree.status();
+  }
+
+  // Walk outer frames (closest to main) before inner ones (closest to the
+  // malloc/calloc/realloc call), so that a caller-level typed cast wins over
+  // an alloc-wrapper pass-through deeper in the stack.
+  for (size_t steps_from_outer = 0; steps_from_outer < callstack.size();
+       ++steps_from_outer) {
+    if (absl::Now() >= deadline) {
+      return absl::DeadlineExceededError("Type resolution timed out");
+    }
+
+    const size_t frame_index =
+        callstack.size() - 1 - steps_from_outer;
+    const auto& frame = callstack[frame_index];
+    auto frame_type_tree = ResolveTypeFromFrame(frame);
+
+    if (frame_type_tree.ok()) {
+      TypeResolutionResult resolution_result;
+      resolution_result.type_tree = std::move(frame_type_tree.value());
+      resolution_result.allocation_category = AllocationCategory::kSimple;
+      resolution_result.resolution_strategy = "heapalloc";
+      return resolution_result;
     }
   }
 
-  // If we couldn't resolve the type from the first frame, try to walk
-  // the callstack from the top and try to find container allocation
-  // type.
-  ASSIGN_OR_RETURN(const ContainerResolutionStrategy resolution_strategy,
-                   GetCallStackContainerResolutionStrategy(callstack));
-  auto type_tree_or = ResolveTypeFromResolutionStrategy(
-      resolution_strategy, callstack, request_size);
-  if (type_tree_or.ok()) {
-    return type_tree_or;
-  } else {
-    return type_tree_or.status();
-  }
+  return container_resolution_status;
 }
 
 absl::StatusOr<std::unique_ptr<TypeTree>>
 DwarfTypeResolver::ResolveTypeFromFrame(
     const DwarfMetadataFetcher::Frame& frame) {
-  DwarfMetadataFetcher::Frame frame_copy = DwarfMetadataFetcher::Frame(frame);
+  DwarfMetadataFetcher::Frame frame_copy(frame);
+
   absl::StatusOr<std::string> type_name =
       metadata_fetcher_->GetHeapAllocType(frame_copy);
 
-  if (!type_name.ok()) {
-    // If we fail, lookup the type name with column 0, in case column values are
-    // not contained in dwarf data.
+  if (!type_name.ok() && frame_copy.column != 0) {
     frame_copy.column = 0;
-    ASSIGN_OR_RETURN(type_name,
-                     metadata_fetcher_->GetHeapAllocType(frame_copy));
+    type_name = metadata_fetcher_->GetHeapAllocType(frame_copy);
   }
-  return CreateTreeFromDwarf(type_name.value(), false, "none");
+
+  if (!type_name.ok()) {
+    return type_name.status();
+  }
+
+  auto type_tree = CreateTreeFromDwarf(type_name.value(), false, "none");
+  if (!type_tree.ok()) {
+    return type_tree.status();
+  }
+
+  return type_tree;
 }
 
 }  // namespace devtools_crosstool_fdo_field_access

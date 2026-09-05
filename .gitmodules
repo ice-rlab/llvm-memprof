@@ -19,3 +19,9 @@
 	path = testsuite/clang-memprof
 	url = git@github.com:mattweingarten/llvm-project.git
 	branch = heapalloc
+[submodule "testsuite/fleetbench"]
+	path = testsuite/fleetbench
+	url = git@github.com:ice-rlab/fleetbench.git
+[submodule "testsuite/llama"]
+	path = testsuite/llama
+	url = git@github.com:ice-rlab/llama.git

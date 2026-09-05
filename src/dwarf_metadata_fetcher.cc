@@ -19,6 +19,7 @@
 #include <sys/types.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +31,7 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -55,6 +57,7 @@
 #include "llvm/include/llvm/Object/Binary.h"
 #include "llvm/include/llvm/Object/ObjectFile.h"
 #include "llvm/include/llvm/Support/Debug.h"
+#include "llvm/include/llvm/Support/WithColor.h"
 #include "llvm/include/llvm/Support/raw_ostream.h"
 #include "status_macros.h"
 
@@ -343,17 +346,19 @@ absl::Status DwarfMetadataFetcher::MetadataPack::ParseDWARF(
   auto dwarf_info = llvm::DWARFContext::create(
       *object_binary.getBinary(),
       llvm::DWARFContext::ProcessDebugRelocations::Ignore, nullptr,
-      dwp_file_path);
+      dwp_file_path, llvm::WithColor::defaultErrorHandler,
+      llvm::WithColor::defaultWarningHandler,
+      /*ThreadSafe=*/parse_thread_count_ > 1);
 
-  auto VisitSibAndChildren = [this, should_read_subprogram](
-                                 const std::unique_ptr<llvm::DWARFUnit> &unit,
+  auto VisitSibAndChildren = [should_read_subprogram](
+                                 MetadataPack *pack, llvm::DWARFUnit *unit,
                                  const ParseContext &context) -> absl::Status {
-    RETURN_IF_ERROR(this->TryUpdatePointerSize(unit->getAddressByteSize()));
+    RETURN_IF_ERROR(pack->TryUpdatePointerSize(unit->getAddressByteSize()));
     llvm::DWARFDie sib_die = unit->getUnitDIE(false);
     while (sib_die) {
       llvm::DWARFDie child_die = sib_die.getFirstChild();
       while (child_die) {
-        this->root_space->VisitChildDIE(child_die, should_read_subprogram,
+        pack->root_space->VisitChildDIE(child_die, should_read_subprogram,
                                         context);
         child_die = child_die.getSibling();
       }
@@ -364,6 +369,77 @@ absl::Status DwarfMetadataFetcher::MetadataPack::ParseDWARF(
 
   absl::Time start_time = absl::Now();
   ParseContext context;
+
+  auto ParseUnits =
+      [&](absl::string_view description,
+          const std::vector<llvm::DWARFUnit *> &units) -> absl::Status {
+    if (units.empty()) {
+      return absl::OkStatus();
+    }
+
+    const size_t worker_count = std::min<size_t>(
+        std::max<uint32_t>(1, parse_thread_count_), units.size());
+
+    LOG(INFO) << "Parsing " << units.size() << " DWARF units from "
+              << description << " using " << worker_count << " thread(s)";
+
+    if (worker_count == 1) {
+      for (llvm::DWARFUnit *unit : units) {
+        RETURN_IF_ERROR(VisitSibAndChildren(this, unit, context));
+      }
+
+      return absl::OkStatus();
+    }
+
+    std::vector<std::unique_ptr<MetadataPack>> local_packs;
+    local_packs.reserve(worker_count);
+
+    for (size_t i = 0; i < worker_count; ++i) {
+      local_packs.push_back(std::make_unique<MetadataPack>());
+    }
+
+    std::vector<absl::Status> worker_statuses(worker_count, absl::OkStatus());
+
+    std::atomic<size_t> next_unit{0};
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+
+    for (size_t worker_id = 0; worker_id < worker_count; ++worker_id) {
+      workers.emplace_back([&, worker_id]() {
+        MetadataPack *local_pack = local_packs[worker_id].get();
+
+        while (true) {
+          const size_t unit_index =
+              next_unit.fetch_add(1, std::memory_order_relaxed);
+
+          if (unit_index >= units.size()) {
+            break;
+          }
+
+          absl::Status status =
+              VisitSibAndChildren(local_pack, units[unit_index], context);
+
+          if (!status.ok()) {
+            worker_statuses[worker_id] = std::move(status);
+            return;
+          }
+        }
+      });
+    }
+    for (std::thread &worker : workers) {
+      worker.join();
+    }
+    for (const absl::Status &status : worker_statuses) {
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    for (auto &local_pack : local_packs) {
+      RETURN_IF_ERROR(this->Insert(*local_pack));
+    }
+    return absl::OkStatus();
+  };
 
   if (!dwp_file_path.empty()) {
     auto dwp_dwarf_info = dwarf_info->getDWOContext(dwp_file_path.c_str());
@@ -413,28 +489,37 @@ absl::Status DwarfMetadataFetcher::MetadataPack::ParseDWARF(
       }
     }
 
-    LOG(INFO) << "Start parsing dwp file ...";
+    LOG(INFO) << "Start parsing dwp file with " << parse_thread_count_
+              << "threads ...";
+    std::vector<llvm::DWARFUnit *> dwp_units;
+
     for (const std::unique_ptr<llvm::DWARFUnit> &unit :
          dwp_dwarf_info->dwo_types_section_units()) {
-      RETURN_IF_ERROR(VisitSibAndChildren(unit, context));
+      dwp_units.push_back(unit.get());
     }
+
     for (const std::unique_ptr<llvm::DWARFUnit> &unit :
          dwp_dwarf_info->dwo_info_section_units()) {
-      RETURN_IF_ERROR(VisitSibAndChildren(unit, context));
+      dwp_units.push_back(unit.get());
     }
+
+    RETURN_IF_ERROR(ParseUnits("DWP file", dwp_units));
   }
 
   LOG(INFO) << "Start parsing binary file ...";
+  std::vector<llvm::DWARFUnit *> binary_units;
+
   for (const std::unique_ptr<llvm::DWARFUnit> &unit :
        dwarf_info->types_section_units()) {
-    RETURN_IF_ERROR(VisitSibAndChildren(unit, context));
-  }
-  for (const std::unique_ptr<llvm::DWARFUnit> &unit :
-       dwarf_info->info_section_units()) {
-    // unit->dump(llvm::outs(), llvm::DIDumpOptions());
-    RETURN_IF_ERROR(VisitSibAndChildren(unit, context));
+    binary_units.push_back(unit.get());
   }
 
+  for (const std::unique_ptr<llvm::DWARFUnit> &unit :
+       dwarf_info->info_section_units()) {
+    binary_units.push_back(unit.get());
+  }
+
+  RETURN_IF_ERROR(ParseUnits("binary file", binary_units));
   /* ======== Multithreaded version: Some issues for now ======== */
 
   // for (const auto& [signature, type_name] : context.signature_to_type_name) {
@@ -666,32 +751,86 @@ void DwarfMetadataFetcher::TypeData::VisitChildDIE(
           die.getAttributeValueAsReferencedDie(llvm::dwarf::DW_AT_type);
 
       type_die = RecursiveGetTypedefDIE(type_die);
-      if (!die.isValid()) {
+      if (!type_die.isValid()) {
         break;
       }
-      std::string type_name = GetTypeQualifiedName(type_die);
-      uint64_t line_offset = die.getDeclLine() - die.getParent().getDeclLine();
-      uint64_t col_number =
-          llvm::dwarf::toUnsigned(die.find(llvm::dwarf::DW_AT_decl_column), 0);
-      std::string func_name = "";
-      if (die.find(llvm::dwarf::DW_AT_name)) {
-        func_name = die.getShortName();
+
+      const std::string type_name = GetTypeQualifiedName(type_die);
+      const llvm::DWARFDie parent_die = die.getParent();
+
+      uint64_t line_offset = 0;
+      if (parent_die.isValid()) {
+        const uint64_t alloc_line = die.getDeclLine();
+        const uint64_t function_line = parent_die.getDeclLine();
+
+        if (alloc_line >= function_line) {
+          line_offset = alloc_line - function_line;
+        }
       }
-      if (func_name == "") {
-        const char *linkage_name = die.getParent().getLinkageName();
-        if (linkage_name != nullptr) {
+
+      const uint64_t col_number =
+          llvm::dwarf::toUnsigned(die.find(llvm::dwarf::DW_AT_decl_column), 0);
+
+      std::string func_name;
+
+      llvm::DWARFDie specification_die;
+      if (parent_die.isValid()) {
+        specification_die = parent_die.getAttributeValueAsReferencedDie(
+            llvm::dwarf::DW_AT_specification);
+      }
+
+      // First priority: linkage name on the concrete subprogram DIE.
+      if (parent_die.isValid()) {
+        const char *linkage_name = parent_die.getLinkageName();
+        if (linkage_name != nullptr && linkage_name[0] != '\0') {
           func_name = linkage_name;
         }
       }
-      if (func_name == "") {
-        auto spec_die = die.getParent().getAttributeValueAsReferencedDie(
-            llvm::dwarf::DW_AT_specification);
-        if (spec_die.isValid()) {
-          func_name = spec_die.getShortName();
+
+      // Second priority: linkage name from DW_AT_specification.
+      if (func_name.empty() && specification_die.isValid()) {
+        const char *linkage_name = specification_die.getLinkageName();
+        if (linkage_name != nullptr && linkage_name[0] != '\0') {
+          func_name = linkage_name;
         }
       }
+
+      // Third priority: DW_AT_name from DW_AT_specification.
+      if (func_name.empty() && specification_die.isValid() &&
+          specification_die.find(llvm::dwarf::DW_AT_name)) {
+        const char *short_name = specification_die.getShortName();
+        if (short_name != nullptr && short_name[0] != '\0') {
+          func_name = short_name;
+        }
+      }
+
+      // Fourth priority: DW_AT_name on the concrete subprogram DIE.
+      if (func_name.empty() && parent_die.isValid() &&
+          parent_die.find(llvm::dwarf::DW_AT_name)) {
+        const char *short_name = parent_die.getShortName();
+        if (short_name != nullptr && short_name[0] != '\0') {
+          func_name = short_name;
+        }
+      }
+
+      // Final fallback: a name directly attached to the heapalloc DIE.
+      if (func_name.empty() && die.find(llvm::dwarf::DW_AT_name)) {
+        const char *short_name = die.getShortName();
+        if (short_name != nullptr && short_name[0] != '\0') {
+          func_name = short_name;
+        }
+      }
+
+      if (func_name.empty()) {
+        // VLOG(1) << "[heapalloc] Skipping unnamed heapalloc site"
+        //         << " line_offset=" << line_offset << " column=" << col_number
+        //         << " type=" << type_name;
+        break;
+      }
+
       heapalloc_sites.insert(
           {Frame(func_name, line_offset, col_number), type_name});
+
       break;
     }
     case llvm::dwarf::DW_TAG_typedef: {
@@ -912,62 +1051,139 @@ absl::StatusOr<const DwarfMetadataFetcher::TypeData *>
 DwarfMetadataFetcher::SearchType(
     const DwarfMetadataFetcher::TypeData *parent_type,
     const std::vector<absl::string_view> &names, int cur) const {
-  absl::string_view cur_name = names[cur];
+  if (parent_type == nullptr) {
+    return absl::InvalidArgumentError(
+        "SearchType called with a null parent type");
+  }
 
-  // If the current name is the anonymous namespace, then we do a greedy search
-  // for any subtype that has prefix Anon and is namespace. This is hacky way to
-  // solve the new way of dealing with namespaces by giving anonymous types
-  // actual names. In theory, this 'could' cause conflicts, but this would
-  // require very terrible naming?
+  if (names.empty()) {
+    return absl::InvalidArgumentError(
+        "SearchType called with an empty type name");
+  }
+
+  if (cur < 0 || static_cast<size_t>(cur) >= names.size()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("SearchType index out of bounds: cur=", cur,
+                     ", names.size()=", names.size()));
+  }
+
+  // Own this string. Do not use the potentially short-lived string_view
+  // directly as the heterogeneous hash-map lookup key.
+  const std::string cur_name(names[cur]);
+  const bool is_last = static_cast<size_t>(cur + 1) == names.size();
+
+  // This state remains active across:
+  //
+  //   SearchType -> GetType -> SearchType
+  //
+  // Consequently, indirect cycles such as A -> B -> A are detected too.
+  // thread_local makes independent resolver threads use independent guards.
+  static thread_local absl::flat_hash_set<const std::string *>
+      resolving_typedefs;
+
+  struct TypedefResolutionGuard {
+    absl::flat_hash_set<const std::string *> *resolving;
+    const std::string *typedef_identity;
+
+    ~TypedefResolutionGuard() { resolving->erase(typedef_identity); }
+  };
+
+  // Anonymous namespace handling.
   if (cur_name == "(anonymous namespace)") {
-    for (auto it = parent_type->types.begin(); it != parent_type->types.end();
-         ++it) {
-      if (absl::StartsWith(it->first, "Anon") &&
-          it->second->data_type == DataType::NAMESPACE) {
-        auto type_or = SearchType(it->second.get(), names, cur + 1);
-        if (type_or.status().ok()) {
+    if (is_last) {
+      return absl::NotFoundError(absl::StrCat(
+          "anonymous namespace is the final component of type name: ",
+          MergeNames(names)));
+    }
+
+    for (const auto &[name, type] : parent_type->types) {
+      if (absl::StartsWith(name, "Anon") &&
+          type->data_type == DataType::NAMESPACE) {
+        auto type_or = SearchType(type.get(), names, cur + 1);
+        if (type_or.ok()) {
           return type_or;
+        }
+
+        if (!absl::IsNotFound(type_or.status())) {
+          return type_or.status();
         }
       }
     }
+
     return absl::NotFoundError(absl::StrCat(
         "type not found, stuck in anonymous namespace: ", MergeNames(names)));
   }
 
-  // If we find a typedef, we need to start over searching from the root type
-  // space. This is because the type referred to by a typedef can be in a
-  // completely different namespace hierarchy.
-  if (parent_type->typedef_type.contains(cur_name)) {
-    cur_name = parent_type->typedef_type.at(cur_name);
-    return GetType(cur_name);
+  // Prefer an actual terminal type over a same-named typedef.
+  //
+  // This handles DWARF layouts that effectively contain:
+  //
+  //   types["node"] = <struct node>
+  //   typedef_type["node"] = "node"
+  //
+  // Following that typedef first would recurse forever.
+  if (is_last) {
+    auto type_it = parent_type->types.find(cur_name);
+    if (type_it != parent_type->types.end()) {
+      return type_it->second.get();
+    }
   }
 
-  // If it is the last item, i.e. the short type_name without namespaces,
-  // then search the parent_type's sub types, returns not found if not
-  // match.
-  if (cur == names.size() - 1) {
-    if (parent_type->types.contains(cur_name)) {
-      return parent_type->types.at(cur_name).get();
+  // Follow a typedef by restarting from the root namespace through GetType.
+  auto typedef_it = parent_type->typedef_type.find(cur_name);
+  if (typedef_it != parent_type->typedef_type.end()) {
+    // The mapped std::string identifies this particular typedef entry.
+    // This assumes the parsed type maps are immutable during resolution.
+    const std::string *typedef_identity = &typedef_it->second;
+    const std::string target_name = typedef_it->second;
+
+    if (target_name.empty()) {
+      return absl::FailedPreconditionError(
+          absl::StrCat("typedef has an empty target: ", cur_name));
     }
+
+    auto [unused_it, inserted] = resolving_typedefs.insert(typedef_identity);
+    (void)unused_it;
+
+    if (!inserted) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "typedef cycle detected while resolving `", MergeNames(names), "`: `",
+          cur_name, "` -> `", target_name, "`"));
+    }
+
+    TypedefResolutionGuard guard{
+        &resolving_typedefs,
+        typedef_identity,
+    };
+
+    return GetType(target_name);
+  }
+
+  if (is_last) {
     return absl::NotFoundError(
         absl::StrCat("type not found: ", MergeNames(names)));
   }
-  // Reaching here means cur_name is not the short type_name but a namespace.
-  // If parent_type has a sub type/namespace that matches the current
-  // namespace name, then search it.
-  if (parent_type->types.contains(cur_name)) {
-    auto type_or =
-        SearchType(parent_type->types.at(cur_name).get(), names, cur + 1);
-    if (type_or.status().ok()) {
+
+  // Treat the current component as a namespace or enclosing type.
+  auto type_it = parent_type->types.find(cur_name);
+  if (type_it != parent_type->types.end()) {
+    auto type_or = SearchType(type_it->second.get(), names, cur + 1);
+    if (type_or.ok()) {
       return type_or;
     }
+
+    // Preserve cycle, corruption, and invalid-input errors.
+    if (!absl::IsNotFound(type_or.status())) {
+      return type_or.status();
+    }
   }
-  // If no match so far, then it is possible that the target type falls
-  // into the "empty-name-parent-type", so search the type with empty
-  // name.
-  if (parent_type->types.contains("")) {
-    return SearchType(parent_type->types.at("").get(), names, cur + 1);
+
+  // Try the unnamed parent type.
+  auto empty_parent_it = parent_type->types.find("");
+  if (empty_parent_it != parent_type->types.end()) {
+    return SearchType(empty_parent_it->second.get(), names, cur + 1);
   }
+
   return absl::NotFoundError(
       absl::StrCat("type not found: ", MergeNames(names)));
 }
@@ -1084,25 +1300,112 @@ bool DwarfMetadataFetcher::MetadataPack::Empty() const {
   return root_space->types.empty() && root_space->typedef_type.empty();
 }
 
+void DwarfMetadataFetcher::TypeData::MergeFrom(TypeData &other) {
+  if (name.empty() && !other.name.empty()) {
+    name = other.name;
+  }
+
+  if (size < 0 && other.size >= 0) {
+    size = other.size;
+  }
+
+  if (data_type == DataType::UNKNOWN && other.data_type != DataType::UNKNOWN) {
+    data_type = other.data_type;
+  }
+
+  for (auto &other_field : other.fields) {
+    if (!other_field) {
+      continue;
+    }
+
+    bool duplicate = false;
+
+    for (const auto &field : fields) {
+      if (field->offset == other_field->offset &&
+          field->type_name == other_field->type_name &&
+          field->name == other_field->name) {
+        duplicate = true;
+        break;
+      }
+    }
+
+    if (duplicate) {
+      continue;
+    }
+
+    const size_t new_index = fields.size();
+    const int64_t offset = other_field->offset;
+
+    fields.push_back(std::move(other_field));
+
+    if (offset >= 0) {
+      offset_idx[offset].insert(new_index);
+    }
+  }
+
+  for (const auto &[alias, type_name] : other.typedef_type) {
+    if (!typedef_type.contains(alias)) {
+      typedef_type.emplace(alias, type_name);
+    }
+  }
+
+  for (const auto &parameter : other.formal_parameters) {
+    if (std::find(formal_parameters.begin(), formal_parameters.end(),
+                  parameter) == formal_parameters.end()) {
+      formal_parameters.push_back(parameter);
+    }
+  }
+
+  for (const auto &[frame, type_name] : other.heapalloc_sites) {
+    if (!heapalloc_sites.contains(frame)) {
+      heapalloc_sites.emplace(frame, type_name);
+    }
+  }
+
+  for (const auto &[variable, value] : other.constant_variables) {
+    if (!constant_variables.contains(variable)) {
+      constant_variables.emplace(variable, value);
+    }
+  }
+
+  for (auto &[child_name, child] : other.types) {
+    if (!child) {
+      continue;
+    }
+
+    auto it = types.find(child_name);
+
+    if (it == types.end()) {
+      types.emplace(child_name, std::move(child));
+    } else {
+      it->second->MergeFrom(*child);
+    }
+  }
+}
+
 absl::Status DwarfMetadataFetcher::MetadataPack::Insert(MetadataPack &other) {
   if (other.Empty()) {
     return absl::OkStatus();
   }
-  if (pointer_size != 0 && pointer_size != other.pointer_size) {
-    return absl::InternalError("Pointer size inconsistent");
-  }
-  pointer_size = other.pointer_size;
-  for (auto &p : other.root_space->types) {
-    if (!root_space->types.contains(p.first)) {
-      root_space->types[p.first] = std::move(p.second);
+
+  if (other.pointer_size != 0) {
+    if (pointer_size != 0 && pointer_size != other.pointer_size) {
+      return absl::InternalError("Pointer size inconsistent");
+    }
+
+    if (pointer_size == 0) {
+      pointer_size = other.pointer_size;
     }
   }
-  root_space->typedef_type.insert(other.root_space->typedef_type.begin(),
-                                  other.root_space->typedef_type.end());
+
+  root_space->MergeFrom(*other.root_space);
+
   formal_and_template_param_map.insert(
       other.formal_and_template_param_map.begin(),
       other.formal_and_template_param_map.end());
+
   heapalloc_sites.merge(other.heapalloc_sites);
+
   return absl::OkStatus();
 }
 

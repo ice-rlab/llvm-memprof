@@ -47,7 +47,7 @@ ABSL_FLAG(int64_t, limit, -1,
 ABSL_FLAG(bool, dump_unresolved_callstacks, false,
           "Flag for debugging. Dumps callstacks that are not resolved instead "
           "of resolved type trees.");
-ABSL_FLAG(uint32_t, parse_thread_count, 128,
+ABSL_FLAG(uint32_t, parse_thread_count, 32,
           "Number of threads to use for parsing DWARF files.");
 
 // Local mode flags.

@@ -18,6 +18,7 @@
 #define HISTOGRAM_BUILDER_H_
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -31,6 +32,7 @@
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+// #include "allocation_data.h"
 #include "dwarf_metadata_fetcher.h"
 #include "llvm/include/llvm/ProfileData/MemProf.h"
 #include "llvm/include/llvm/ProfileData/MemProfReader.h"
@@ -58,6 +60,19 @@ namespace devtools_crosstool_fdo_field_access {
 class TypeTreeStore {
  public:
   using CallStack = std::vector<DwarfMetadataFetcher::Frame>;
+
+  struct AllocationRange {
+    uint64_t alloc_address = 0;
+    uint64_t size = 0;
+    uint64_t alloc_timestamp = 0;
+    uint64_t dealloc_timestamp = 0;
+  };
+
+  struct TypeTreeStoreEntry {
+    std::shared_ptr<TypeTree> type_tree;
+    std::vector<AllocationRange> allocation_ranges;
+  };
+
   TypeTreeStore() = default;
   ~TypeTreeStore() = default;
 
@@ -69,20 +84,23 @@ class TypeTreeStore {
   static CallStack ConvertCallStack(
       absl::Span<const llvm::memprof::Frame> callstack);
 
-  // Inserts the given callstack and type tree into the type tree store. If the
-  // callstack already exists in the trie, the access counts of the existing
-  // type tree are merged with the new type tree. If the types do not match, an
-  // error is returned.
+  // Inserts the given callstack, type tree, and allocation ranges into the
+  // type tree store. If the callstack already exists in the store, the access
+  // counts of the existing type tree are merged with the new type tree and the
+  // new allocation ranges are appended. If the types do not match, an error is
+  // returned.
   absl::Status Insert(
       const std::vector<DwarfMetadataFetcher::Frame>& callstack,
-      std::unique_ptr<devtools_crosstool_fdo_field_access::TypeTree> type_tree);
+      std::unique_ptr<devtools_crosstool_fdo_field_access::TypeTree> type_tree,
+      std::vector<AllocationRange> allocation_ranges = {});
 
   // Same as above, but takes a callstack of memprof Frames.
   absl::Status Insert(
       absl::Span<const llvm::memprof::Frame> callstack,
-      std::unique_ptr<devtools_crosstool_fdo_field_access::TypeTree>
-          type_tree) {
-    return Insert(ConvertCallStack(callstack), std::move(type_tree));
+      std::unique_ptr<devtools_crosstool_fdo_field_access::TypeTree> type_tree,
+      std::vector<AllocationRange> allocation_ranges = {}) {
+    return Insert(ConvertCallStack(callstack), std::move(type_tree),
+                  std::move(allocation_ranges));
   };
 
   // Same as Insert, but returns the type tree for the given callstack.
@@ -119,6 +137,9 @@ class TypeTreeStore {
 
   absl::flat_hash_map<CallStack, std::shared_ptr<TypeTree>>
       callstack_to_type_tree_;
+
+  absl::flat_hash_map<CallStack, std::vector<AllocationRange>>
+      callstack_to_allocation_ranges_;
 };
 
 class TypeTreeStoreList : public TypeTreeStore {
@@ -163,6 +184,30 @@ class TypeTreeStoreList : public TypeTreeStore {
 };
 
 struct Statistics {
+  struct TypeStatistics {
+    uint64_t callstack_count = 0;
+    uint64_t resolution_key_count = 0;
+    uint64_t allocation_count = 0;
+    uint64_t access_count = 0;
+    uint64_t size_bytes = 0;
+  };
+
+  struct ResolutionPolicyStatistics {
+    uint64_t callstack_count = 0;
+    uint64_t resolution_key_count = 0;
+    uint64_t allocation_count = 0;
+    uint64_t raw_access_count = 0;
+    uint64_t raw_size_bytes = 0;
+  };
+
+  struct AllocationCategoryStatistics {
+    uint64_t callstack_count = 0;
+    uint64_t resolution_key_count = 0;
+    uint64_t allocation_count = 0;
+    uint64_t access_count = 0;
+    uint64_t size_bytes = 0;
+  };
+
   // Allocation tracking.
   uint64_t total_allocations_count = 0;
   uint64_t total_found_type = 0;
@@ -172,11 +217,65 @@ struct Statistics {
   uint64_t total_record_count = 0;
   uint64_t total_after_filtering = 0;
   uint64_t duplicate_callstack_count = 0;
+
+  // Callstack tracking.
+  uint64_t unique_callstack_count = 0;
+  uint64_t resolved_callstack_count = 0;
+  uint64_t unresolved_callstack_count = 0;
+  uint64_t verified_callstack_count = 0;
+  uint64_t record_callstack_count = 0;
+  uint64_t container_callstack_count = 0;
+  uint64_t heap_alloc_callstack_count = 0;
+
+  // Resolution-key tracking.
+  uint64_t unique_resolution_key_count = 0;
+  uint64_t resolved_resolution_key_count = 0;
+  uint64_t unresolved_resolution_key_count = 0;
+  uint64_t after_filtering_resolution_key_count = 0;
+  uint64_t type_filtered_resolution_key_count = 0;
+  uint64_t only_records_filtered_resolution_key_count = 0;
+  uint64_t verified_resolution_key_count = 0;
+  uint64_t record_resolution_key_count = 0;
+  uint64_t container_resolution_key_count = 0;
+  uint64_t heap_alloc_resolution_key_count = 0;
+  uint64_t duplicate_resolution_count = 0;
+  uint64_t inserted_tree_count = 0;
+  uint64_t final_type_tree_store_size = 0;
+
   // Access tracking.
+  uint64_t total_raw_accesses = 0;
+  uint64_t resolved_raw_accesses = 0;
+  uint64_t unresolved_raw_accesses = 0;
   uint64_t total_accesses = 0;
   uint64_t total_accesses_on_heapallocs = 0;
   uint64_t total_accesses_on_containers = 0;
   uint64_t total_accesses_on_records = 0;
+
+  // Allocation-size tracking.
+  uint64_t total_raw_size_bytes = 0;
+  uint64_t resolved_raw_size_bytes = 0;
+  uint64_t unresolved_raw_size_bytes = 0;
+  uint64_t total_size_bytes = 0;
+  uint64_t total_size_bytes_on_heapallocs = 0;
+  uint64_t total_size_bytes_on_containers = 0;
+  uint64_t total_size_bytes_on_records = 0;
+
+  // Root-char tracking.
+  uint64_t char_root_callstack_count = 0;
+  uint64_t char_root_resolution_key_count = 0;
+  uint64_t char_root_allocation_count = 0;
+  uint64_t char_root_access_count = 0;
+  uint64_t char_root_size_bytes = 0;
+
+  // Per-type tracking.
+  std::map<std::string, TypeStatistics> type_statistics;
+
+  std::map<std::string, ResolutionPolicyStatistics>
+      resolution_policy_statistics;
+
+  std::map<std::string, AllocationCategoryStatistics>
+      allocation_category_statistics;
+
   void Log() const;
 };
 
@@ -218,14 +317,16 @@ class LocalHistogramBuilder : public AbstractHistogramBuilder {
       std::unique_ptr<DwarfTypeResolver> dwarf_type_resolver,
       std::vector<std::string> type_prefix_filter,
       std::vector<std::string> callstack_filter, bool only_records,
-      bool verify_verbose, bool dump_unresolved_callstacks)
+      bool verify_verbose, bool dump_unresolved_callstacks,
+      uint32_t type_resolution_thread_count)
       : memprof_reader_(std::move(memprof_reader)),
         dwarf_type_resolver_(std::move(dwarf_type_resolver)),
         type_prefix_filter_(type_prefix_filter),
         callstack_filter_(callstack_filter),
         only_records_(only_records),
         verify_verbose_(verify_verbose),
-        dump_unresolved_callstacks_(dump_unresolved_callstacks) {}
+        dump_unresolved_callstacks_(dump_unresolved_callstacks),
+        type_resolution_thread_count_(type_resolution_thread_count) {}
   ~LocalHistogramBuilder() override = default;
 
   absl::StatusOr<std::unique_ptr<HistogramBuilderResults>> BuildHistogram()
@@ -255,6 +356,7 @@ class LocalHistogramBuilder : public AbstractHistogramBuilder {
   bool verify_verbose_;
   // If true, print out callstacks of types that are not resolved.
   bool dump_unresolved_callstacks_;
+  uint32_t type_resolution_thread_count_;
 };
 
 }  // namespace devtools_crosstool_fdo_field_access
